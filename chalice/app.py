@@ -533,7 +533,7 @@ class RouteEntry(object):
 
     def __init__(self, view_function, view_name, path, method,
                  api_key_required=None, content_types=None,
-                 cors=False, authorizer=None):
+                 cors=False, authorizer=None, metadata=None):
         self.view_function = view_function
         self.view_name = view_name
         self.uri_pattern = path
@@ -543,6 +543,7 @@ class RouteEntry(object):
         #: e.g, '/foo/{bar}/{baz}/qux -> ['bar', 'baz']
         self.view_args = self._parse_view_args()
         self.content_types = content_types
+        self.metadata = metadata
         # cors is passed as either a boolean or a CORSConfig object. If it is a
         # boolean it needs to be replaced with a real CORSConfig object to
         # pass the typechecker. None in this context will not inject any cors
@@ -1087,6 +1088,7 @@ class _HandlerRegistration(object):
             'content_types': actual_kwargs.pop('content_types',
                                                ['application/json']),
             'cors': actual_kwargs.pop('cors', self.api.cors),
+            'metadata': actual_kwargs.pop('metadata', None)
         }
         if route_kwargs['cors'] is None:
             route_kwargs['cors'] = self.api.cors
@@ -1643,6 +1645,22 @@ class RestAPIEventHandler(BaseLambdaHandler):
         except Exception:
             return self._unhandled_exception_to_response()
 
+    def _create_route_entry(self, event):
+            resource_path = event.get('requestContext', {}).get('resourcePath')
+            if resource_path is None:
+                return error_response(error_code='InternalServerError',
+                                  message='Unknown request.',
+                                  http_status_code=500)
+            http_method = event['requestContext']['httpMethod']
+            if http_method not in self.routes[resource_path]:
+                allowed_methods = ', '.join(self.routes[resource_path].keys())
+                return error_response(
+                    error_code='MethodNotAllowedError',
+                    message='Unsupported method: %s' % http_method,
+                    http_status_code=405,
+                    headers={'Allow': allowed_methods})
+            return self.routes[resource_path][http_method]
+    
     def create_request_object(self, event, context):
         # For legacy reasons, there's some initial validation that takes
         # place before we convert the input event to a python object.
@@ -1653,7 +1671,7 @@ class RestAPIEventHandler(BaseLambdaHandler):
         if resource_path is not None:
             self.current_request = Request(event, context)
             return self.current_request
-
+    
     def __call__(self, event, context):
         def wrapped_event(request):
             return self._main_rest_api_handler(event, context)
@@ -1662,24 +1680,17 @@ class RestAPIEventHandler(BaseLambdaHandler):
             [self._global_error_handler] + list(self._middleware_handlers),
             original_handler=wrapped_event,
         )
+
+        route_entry = self._create_route_entry(event)
+
+        # If metadata exists on a route pass through middleware
+        if route_entry.metadata:
+            self.current_request.metadata = route_entry.metadata
         response = final_handler(self.current_request)
         return response.to_dict(self.api.binary_types)
 
     def _main_rest_api_handler(self, event, context):
-        resource_path = event.get('requestContext', {}).get('resourcePath')
-        if resource_path is None:
-            return error_response(error_code='InternalServerError',
-                                  message='Unknown request.',
-                                  http_status_code=500)
-        http_method = event['requestContext']['httpMethod']
-        if http_method not in self.routes[resource_path]:
-            allowed_methods = ', '.join(self.routes[resource_path].keys())
-            return error_response(
-                error_code='MethodNotAllowedError',
-                message='Unsupported method: %s' % http_method,
-                http_status_code=405,
-                headers={'Allow': allowed_methods})
-        route_entry = self.routes[resource_path][http_method]
+        route_entry = self._create_route_entry(event)
         view_function = route_entry.view_function
         function_args = {name: event['pathParameters'][name]
                          for name in route_entry.view_args}
@@ -1703,6 +1714,7 @@ class RestAPIEventHandler(BaseLambdaHandler):
                     http_status_code=415,
                     headers=cors_headers
                 )
+
         response = self._get_view_function_response(view_function,
                                                     function_args)
         if cors_headers is not None:
